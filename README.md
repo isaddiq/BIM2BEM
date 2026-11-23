@@ -159,4 +159,4 @@ Regenerate data: `npm run gen:schema` (after upgrading `@idfkit/engine-assets`),
 
 ## Credits and licences
 
-MIT licence. EnergyPlus is developed by NREL and the U.S. Department of Energy and is distributed under its own licence (see `@idfkit/engine-assets`); BIM2BEM is not affiliated with or endorsed by them. web-ifc (MPL-2.0), Three.js, React, polygon-clipping (MIT), earcut (ISC), Leaflet (BSD-2-Clause). Icons: see `assets/icons/flaticon/ATTRIBUTION.md`.
+MIT licence. EnergyPlus is developed by NREL and the U.S. Department of Energy and is distributed under its own licence (see `@idfkit/engine-assets`); BIM2BEM is not affiliated with or endorsed by them. web-ifc (MPL-2.0), Three.js, React, polygon-clipping (MIT), earcut (ISC), Leaflet (BSD-2-Clause). Icons: see `assets/icons/flaticon/ATTRIBUTION.md`. Office blocks sample model: BIM Whale samples by André Wisén, MIT (see `assets/ifc/LICENSE-LargeBuilding.txt`).
