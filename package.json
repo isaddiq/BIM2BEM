@@ -18,7 +18,7 @@
     "vendor:engine": "node scripts/vendor.mjs --engine",
     "gen:schema": "node scripts/gen-ep-schema.mjs",
     "gen:stations": "node scripts/gen-station-index.mjs",
-    "gen:sample": "py -3.13 scripts/make_sample_bem_office.py assets/ifc/BEMDemoOffice.ifc",
+    "gen:sample": "py -3.13 scripts/make_sample_bem_office.py assets/ifc/BEMDemoOffice.ifc && py -3.13 scripts/make_sample_bem_office.py assets/ifc/BEMDemoOffice-SB.ifc --space-boundaries",
     "serve": "npx --yes serve ."
   },
   "devDependencies": {

@@ -28,6 +28,11 @@ tests/shots/
 *.log
 npm-debug.log*
 
+# Promo video: captured frames, intermediate renders and encoder output
+video/_work/
+video/*.mp4
+video/*.webm
+
 # Python caches (sample-model generator)
 __pycache__/
 *.pyc

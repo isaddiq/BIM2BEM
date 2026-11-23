@@ -19,6 +19,16 @@ Every number here is a known input, so the conversion can be checked against it:
 Released under the project's MIT licence. Run with a Python that has IfcOpenShell 0.8+:
 
     py -3.13 scripts/make_sample_bem_office.py assets/ifc/BEMDemoOffice.ifc
+    py -3.13 scripts/make_sample_bem_office.py assets/ifc/BEMDemoOffice-SB.ifc --space-boundaries
+
+With --space-boundaries the file also carries second-level space boundaries
+(IfcRelSpaceBoundary2ndLevel), written explicitly: one per room face, on the room's
+inside faces, each an IfcConnectionSurfaceGeometry holding an IfcCurveBoundedPlane in
+the space's ObjectPlacement. Plane Axis = the face normal pointing away from the room,
+outer boundary counter-clockwise about it. Window boundaries are children of their wall
+boundary (ParentBoundary) and holes of its plane (InnerBoundaries). Partition and slab
+boundaries are linked to the room on the other side (CorrespondingBoundary). The geometry
+is the same as the IfcSpace bodies, so both boundary sources must give the same model.
 """
 
 import math
@@ -29,7 +39,9 @@ import ifcopenshell.api
 import ifcopenshell.api.project
 import ifcopenshell.guid
 
-OUT = sys.argv[1] if len(sys.argv) > 1 else "BEMDemoOffice.ifc"
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+OUT = ARGS[0] if ARGS else "BEMDemoOffice.ifc"
+SPACE_BOUNDARIES = "--space-boundaries" in sys.argv
 
 LX, LY = 20.0, 12.0
 STOREY_H = 3.5
@@ -187,9 +199,12 @@ WINDOWS = {
     "NE": [("N", 13.0, 17.0, 0.9, 2.4), ("E", 8.05, 10.05, 0.9, 2.4)],
 }
 
+layout = []  # per storey: the elements the space boundaries refer to
 for li, st in enumerate(storeys):
     sp = st.ObjectPlacement
     contained, spaces = [], []
+    lay = {"spaces": {}, "windows": {code: [] for code, *_ in ROOMS}, "roof": None}
+    layout.append(lay)
     top = STOREY_H if li == 0 else STOREY_H + 0.42 - 0.26  # level 1 walls rise to the roof top
     # Exterior walls: reference line on the outer face, local +Y pointing into the building,
     # layers stacked along +Y from the outside (render) to the inside (plaster).
@@ -215,6 +230,7 @@ for li, st in enumerate(storeys):
         assign_usage(p, "part", "AXIS2")
         add_pset(p, "Pset_WallCommon", [single("IsExternal", False, "IfcBoolean")])
         contained.append(p)
+    lay.update(walls={k: v[0] for k, v in wall_el.items()}, p1=p1, p2a=p2a, p2b=p2b)
     # Floor slab of this storey (ground floor on level 0), reference at the underside, layers upward.
     if li == 0:
         slab = make("IfcSlab", "Ground floor slab", placement(sp, 0, 0, -0.41), [box(0, 0, 0, LX, LY, 0.41)], (0.78, 0.77, 0.74), PredefinedType="BASESLAB")
@@ -224,11 +240,13 @@ for li, st in enumerate(storeys):
         assign_usage(slab, "mid", "AXIS3")
     add_pset(slab, "Pset_SlabCommon", [single("IsExternal", li == 0, "IfcBoolean")])
     contained.append(slab)
+    lay["slab"] = slab
     if li == 1:
         roof = make("IfcSlab", "Roof slab", placement(sp, 0, 0, ROOM_H), [box(0, 0, 0, LX, LY, 0.42)], (0.35, 0.36, 0.38), PredefinedType="ROOF")
         assign_usage(roof, "roof", "AXIS3")
         add_pset(roof, "Pset_SlabCommon", [single("IsExternal", True, "IfcBoolean")])
         contained.append(roof)
+        lay["roof"] = roof
     # Rooms and windows.
     for code, x0, y0, x1, y1 in ROOMS:
         s = make("IfcSpace", f"{li}.{code}", placement(sp), [box(x0, y0, 0, x1, y1, ROOM_H)], (0.31, 0.70, 0.66), 0.7, LongName=f"Office {code} L{li}", PredefinedType="INTERNAL")
@@ -239,6 +257,7 @@ for li, st in enumerate(storeys):
         ])
         f.createIfcRelDefinesByProperties(ifcopenshell.guid.new(), None, None, None, [s], q)
         spaces.append(s)
+        lay["spaces"][code] = (s, x0, y0, x1, y1)
         for wi, (side, a0, a1, sill, head) in enumerate(WINDOWS[code]):
             w, wx, wy, ref, length = wall_el[side]
             # Distance along the wall's local x from its origin.
@@ -257,11 +276,87 @@ for li, st in enumerate(storeys):
             add_pset(win, "Pset_WindowCommon", [single("IsExternal", True, "IfcBoolean"), single("ThermalTransmittance", 1.1, "IfcThermalTransmittanceMeasure")])
             add_pset(win, "Pset_DoorWindowGlazingType", [single("SolarHeatGainTransmittance", 0.45, "IfcNormalisedRatioMeasure"), single("VisibleLightTransmittance", 0.7, "IfcNormalisedRatioMeasure")])
             contained.append(win)
+            lay["windows"][code].append((side, a0, a1, sill, head, win))
     api("spatial.assign_container", products=contained, relating_structure=st)
     api("aggregate.assign_object", products=spaces, relating_object=st)
 
 for (usage, users) in _usage_users.values():
     f.createIfcRelAssociatesMaterial(ifcopenshell.guid.new(), None, None, None, users, usage)
+
+
+def rect_polyline(u0, v0, u1, v1, ccw=True):
+    pts = [(u0, v0), (u1, v0), (u1, v1), (u0, v1)]
+    if not ccw:
+        pts = pts[::-1]
+    return f.createIfcPolyline([f.createIfcCartesianPoint([float(a), float(b)]) for a, b in pts + [pts[0]]])
+
+
+def curve_bounded_plane(origin, normal, u, outer, holes=()):
+    """Rectangles in the plane (Axis = normal, RefDirection = u); 2D boundaries in plane coordinates."""
+    plane = f.createIfcPlane(axis3(*origin, axis=normal, ref=u))
+    return f.createIfcCurveBoundedPlane(plane, rect_polyline(*outer), [rect_polyline(*h, ccw=False) for h in holes])
+
+
+def room_faces(x0, y0, x1, y1):
+    """Inside faces of a room box: side -> (origin, outward normal, u, width, height, project coordinate -> u)."""
+    H = ROOM_H
+    return {
+        "S": ((x0, y0, 0.0), (0, -1, 0), (1, 0, 0), x1 - x0, H, lambda a: a - x0),
+        "N": ((x1, y1, 0.0), (0, 1, 0), (-1, 0, 0), x1 - x0, H, lambda a: x1 - a),
+        "E": ((x1, y0, 0.0), (1, 0, 0), (0, 1, 0), y1 - y0, H, lambda a: a - y0),
+        "W": ((x0, y1, 0.0), (-1, 0, 0), (0, -1, 0), y1 - y0, H, lambda a: y1 - a),
+        "Floor": ((x0, y1, 0.0), (0, 0, -1), (1, 0, 0), x1 - x0, y1 - y0, None),
+        "Ceiling": ((x0, y0, H), (0, 0, 1), (1, 0, 0), x1 - x0, y1 - y0, None),
+    }
+
+
+NEIGHBOURS = {  # (room, side) -> (partition, neighbouring room, its side)
+    ("SW", "N"): ("p1", "NW", "S"), ("SW", "E"): ("p2a", "SE", "W"),
+    ("SE", "N"): ("p1", "NE", "S"), ("SE", "W"): ("p2a", "SW", "E"),
+    ("NW", "S"): ("p1", "SW", "N"), ("NW", "E"): ("p2b", "NE", "W"),
+    ("NE", "S"): ("p1", "SE", "N"), ("NE", "W"): ("p2b", "NW", "E"),
+}
+
+
+def boundary(space, element, geometry, ioe, parent=None):
+    return f.create_entity(
+        "IfcRelSpaceBoundary2ndLevel", GlobalId=ifcopenshell.guid.new(), Name="2ndLevel", Description="2a",
+        RelatingSpace=space, RelatedBuildingElement=element, ConnectionGeometry=f.createIfcConnectionSurfaceGeometry(geometry, None),
+        PhysicalOrVirtualBoundary="PHYSICAL", InternalOrExternalBoundary=ioe, ParentBoundary=parent)
+
+
+if SPACE_BOUNDARIES:
+    made, n_win = {}, 0  # (level, room, side) -> boundary
+    for li, lay in enumerate(layout):
+        for code, (s, x0, y0, x1, y1) in lay["spaces"].items():
+            for side, (origin, normal, u, width, height, along) in room_faces(x0, y0, x1, y1).items():
+                holes = []
+                if side == "Floor":
+                    element, ioe = lay["slab"], ("EXTERNAL_EARTH" if li == 0 else "INTERNAL")
+                elif side == "Ceiling":
+                    element, ioe = (layout[li + 1]["slab"], "INTERNAL") if li == 0 else (lay["roof"], "EXTERNAL")
+                elif side in code:  # an exterior side of this corner room
+                    element, ioe = lay["walls"][side], "EXTERNAL"
+                    for (wside, a0, a1, sill, head, win) in lay["windows"][code]:
+                        if wside == side:
+                            u0, u1 = sorted((along(a0), along(a1)))
+                            holes.append(((u0, sill, u1, head), win))
+                else:
+                    element, ioe = lay[NEIGHBOURS[(code, side)][0]], "INTERNAL"
+                b = boundary(s, element, curve_bounded_plane(origin, normal, u, (0, 0, width, height), [h for h, _ in holes]), ioe)
+                made[(li, code, side)] = b
+                for rect, win in holes:  # the window boundary lies in its wall boundary's plane
+                    boundary(s, win, curve_bounded_plane(origin, normal, u, rect), "EXTERNAL", parent=b)
+                    n_win += 1
+    for (li, code, side), b in made.items():
+        if side == "Floor" and li == 1:
+            b.CorrespondingBoundary = made[(0, code, "Ceiling")]
+        elif side == "Ceiling" and li == 0:
+            b.CorrespondingBoundary = made[(1, code, "Floor")]
+        elif (code, side) in NEIGHBOURS:
+            _, other, oside = NEIGHBOURS[(code, side)]
+            b.CorrespondingBoundary = made[(li, other, oside)]
+    print(f"Wrote {len(made)} room-face and {n_win} window space boundaries")
 
 f.write(OUT)
 print(f"Wrote {OUT}")

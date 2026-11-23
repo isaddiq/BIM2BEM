@@ -319,7 +319,7 @@ check('Every script listed in index.html exists', srcs.length > 20 && srcs.every
 check('No root-absolute asset paths (GitHub Pages subpath safe)', !/(src|href)="\/(?!\/)/.test(html));
 check('Engine loader and worker are vendored', existsSync(path.join(ROOT, 'assets/vendor/idfkit-engine-0.6.0/index.js')) && existsSync(path.join(ROOT, 'assets/vendor/idfkit-engine-0.6.0/engine.worker.js')));
 check('Engine assets resolve from the CDN pin or a self-hosted copy', /cdn\.jsdelivr\.net\/npm\/@idfkit\/engine-assets@26\.2\.0\/assets/.test(readFileSync(path.join(ROOT, 'assets/js/core/engine.jsx'), 'utf8')));
-check('Sample IFC files are bundled', ['BEMDemoOffice.ifc', 'ResearchCentre.ifc', 'LargeBuilding.ifc'].every(f => existsSync(path.join(ROOT, 'assets/ifc', f))));
+check('Sample IFC files are bundled', ['SeoulExchangeTower.ifc', 'BEMDemoOffice.ifc', 'BEMDemoOffice-SB.ifc', 'ResearchCentre.ifc', 'LargeBuilding.ifc'].every(f => existsSync(path.join(ROOT, 'assets/ifc', f))));
 
 // ---------------------------------------------------------------------------
 section('Test 10 · Reproducibility');
@@ -329,6 +329,66 @@ check('Same inputs → same heating demand (relative difference < 1e-12)', rel(a
 check('Same inputs → same cooling demand', rel(again.res.building.coolKWh, r.building.coolKWh) < 1e-12);
 const tm2 = await buildThermalModel(demo, {});
 check('Conversion is deterministic (same surfaces and areas)', tm2.surfaces.length === tm.surfaces.length && tm2.surfaces.every((s, i) => s.name === tm.surfaces[i].name && s.area === tm.surfaces[i].area));
+
+// ---------------------------------------------------------------------------
+section('Test 11 · IfcRelSpaceBoundary2ndLevel as the source of zone surfaces');
+// BEMDemoOffice-SB.ifc is the demo office with explicit second-level boundaries on the rooms'
+// inside faces (scripts/make_sample_bem_office.py --space-boundaries). The boundary geometry
+// goes through its own path (IfcCurveBoundedPlane in the space placement, web-ifc frame,
+// CorrespondingBoundary pairs, window child boundaries), so both sources must agree with each
+// other and with the hand calculation. Tolerance: 1 mm² / 1 cm³ (float rounding only).
+const sbModel = await loadIfc('assets/ifc/BEMDemoOffice-SB.ifc');
+models.sb = sbModel;
+const sbData = await sbModel.readSpaceBoundaries();
+check('Second-level boundaries read: 48 room faces + 16 windows, no geometry errors', sbData.boundaries.length === 64 && sbData.boundaries.every(b => b.level === '2nd' && !b.error && b.polys.length === 1), `${sbData.boundaries.length} boundaries`);
+check('CorrespondingBoundary links read (24 = 12 pairs × 2)', sbData.boundaries.filter(b => b.correspondingId != null).length === 24);
+check('Window boundaries carry ParentBoundary', sbData.boundaries.filter(b => b.elementClass === 'IfcWindow').every(b => b.parentId != null && sbData.byId.get(b.parentId)?.elementClass === 'IfcWall'));
+const tmIfc = await buildThermalModel(sbModel, { boundarySource: 'ifc' });
+const tmRec = await buildThermalModel(sbModel, { boundarySource: 'reconstructed' });
+const tmAuto = await buildThermalModel(sbModel, {});
+const s1 = tmIfc.stats, s0 = tmRec.stats;
+check('Auto: all 8 zones and 48 surfaces from IFC boundaries', tmAuto.stats.zonesFromIfcBoundaries === 8 && tmAuto.stats.surfacesFromIfcBoundaries === 48 && tmAuto.surfaces.every(s => s.sbGlobalId && s.sbGlobalId.length === 22));
+check('IFC boundaries vs reconstruction: floor area', near(s1.floorArea, s0.floorArea, 1e-3) && near(s1.floorArea, 467.28, 0.01), `${s1.floorArea.toFixed(3)} / ${s0.floorArea.toFixed(3)} m²`);
+check('IFC boundaries vs reconstruction: volume', near(s1.volume, s0.volume, 1e-3) && near(s1.volume, 1513.9872, 0.05), `${s1.volume.toFixed(3)} / ${s0.volume.toFixed(3)} m³`);
+check('IFC boundaries vs reconstruction: exterior wall area', near(s1.exteriorWallArea, s0.exteriorWallArea, 1e-3) && near(s1.exteriorWallArea, 409.536, 0.01), `${s1.exteriorWallArea.toFixed(3)} / ${s0.exteriorWallArea.toFixed(3)} m²`);
+check('IFC boundaries vs reconstruction: window area (from window boundaries)', near(s1.windowArea, s0.windowArea, 1e-3) && near(s1.windowArea, 84, 0.01) && tmIfc.subsurfaces.every(w => w.sbGlobalId), `${s1.windowArea.toFixed(3)} / ${s0.windowArea.toFixed(3)} m²`);
+check('IFC boundaries vs reconstruction: 12 interzone pairs, all from CorrespondingBoundary', s1.interzonePairs === 12 && s0.interzonePairs === 12 && tmIfc.boundaries.pairsFromIfc === 12);
+check('Same boundary conditions: 20 outdoors, 4 ground, 0 adiabatic', s1.exterior === s0.exterior && s1.ground === 4 && s1.adiabatic === 0 && tmIfc.boundaries.bcConflicts === 0, `${s1.exterior} outdoors`);
+const uOf = (t) => t.surfaces.map(s => `${s.name}|${s.bc}|${t.constructions.get(s.constructionKey).uValue.toFixed(6)}`).sort().join('\n');
+check('Same surfaces, boundary conditions and constructions (U-values) per surface name', uOf(tmIfc) === uOf(tmRec));
+check('Traceability: each surface links to its IfcRelSpaceBoundary and building element', mappingRows(tmIfc, sbModel).filter(r => r.bemObject.startsWith('Building')).every(r => r.spaceBoundaryGlobalId.length === 22 && r.ifcGlobalId.length === 22));
+// Fallbacks: corrupt the parsed boundaries in three ways; each space must fall back for that reason.
+const withBoundaries = (edit) => {
+  const list = sbData.boundaries.map(b => ({ ...b, polys: b.polys.map(p => ({ outer: p.outer.map(q => q.slice()), inners: p.inners })) }));
+  const out = edit(list);
+  const bySpace = new Map();
+  out.forEach(b => { if (!bySpace.has(b.spaceId)) bySpace.set(b.spaceId, []); bySpace.get(b.spaceId).push(b); });
+  return { ...sbModel, readSpaceBoundaries: async () => ({ boundaries: out, byId: new Map(out.map(b => [b.id, b])), bySpace }) };
+};
+const firstSpace = sbModel.byClass.get('IfcSpace')[0];
+const firstWall = sbData.bySpace.get(firstSpace).find(b => b.elementClass === 'IfcWall' && b.correspondingId != null);
+const cases = [
+  ['one boundary missing → not closed', (l) => l.filter(b => b.id !== firstWall.id), /not closed/],
+  ['one boundary reversed → normals inconsistent', (l) => { l.find(b => b.id === firstWall.id).polys[0].outer.reverse(); return l; }, /normals are inconsistent/],
+  ['one boundary moved 0.5 m → off the space body', (l) => { l.find(b => b.id === firstWall.id).polys[0].outer.forEach(p => { p[0] += 0.5; p[2] += 0.5; }); return l; }, /does not lie on the IfcSpace body/],
+];
+for (const [label, edit, why] of cases) {
+  const t = await buildThermalModel(withBoundaries(edit), {});
+  const rep = t.boundaries.spaces.find(s => s.spaceId === firstSpace);
+  const warn = t.issues.find(i => i.code === 'sb-fallback');
+  check(`Fallback, ${label}`, rep.source === 'IfcSpace body' && why.test(rep.reason) && warn && warn.ids.includes(firstSpace) && t.stats.zonesFromIfcBoundaries === 7, rep.reason);
+  check(`  … mixed model still matches the hand calculation (12 pairs, 467.28 m², 409.536 m²)`, t.stats.interzonePairs === 12 && near(t.stats.floorArea, 467.28, 0.01) && near(t.stats.exteriorWallArea, 409.536, 0.01) && near(t.stats.windowArea, 84, 0.01));
+}
+const noSb = await buildThermalModel(demo, { boundarySource: 'ifc' });
+check('File without boundaries, IFC source requested: reconstructed, with a warning', noSb.stats.zonesFromIfcBoundaries === 0 && noSb.issues.some(i => i.code === 'sb-none') && near(noSb.stats.floorArea, 467.28, 0.01));
+check('File without boundaries, auto: unchanged conversion, no boundary warnings', tm.stats.zonesFromIfcBoundaries === 0 && !tm.issues.some(i => /^sb-/.test(i.code)));
+// EnergyPlus with the model built from IFC boundaries.
+const runIfc = await simulate(tmIfc, cfgChi);
+const runRec = await simulate(tmRec, cfgChi);
+const sev = (x) => (x.run.err?.entries || []).filter(e => e.severity === 'severe' || e.severity === 'fatal').length;
+check('Model from IFC boundaries runs with 0 severe errors', runIfc.run.success && sev(runIfc) === 0, `${runIfc.seconds.toFixed(1)} s`);
+const dh = rel(runIfc.res.building.heatKWh, runRec.res.building.heatKWh), dc = rel(runIfc.res.building.coolKWh, runRec.res.building.coolKWh);
+check('Heating and cooling: IFC boundaries vs reconstruction within 0.1 % (identical geometry, vertex order may differ)', dh < 1e-3 && dc < 1e-3, `heating ${runIfc.res.building.heatKWh.toFixed(1)} vs ${runRec.res.building.heatKWh.toFixed(1)} kWh (Δ ${dh.toExponential(1)}), cooling ${runIfc.res.building.coolKWh.toFixed(1)} vs ${runRec.res.building.coolKWh.toFixed(1)} kWh (Δ ${dc.toExponential(1)})`);
 
 disposeEngine();
 Object.values(models).forEach(m => m.close());

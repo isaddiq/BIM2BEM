@@ -56,7 +56,13 @@ function ConvertTab({ model, tm, bemOptions, setBemOptions, onConvert, convertin
         <label><input type="radio" checked={bemOptions.zoning === 'spaces'} onChange={() => setBemOptions(o => ({ ...o, zoning: 'spaces' }))} /> One zone per IfcSpace <span className="muted">({nSpaces} in the file)</span></label>
         <label><input type="radio" checked={bemOptions.zoning === 'storeys'} onChange={() => setBemOptions(o => ({ ...o, zoning: 'storeys' }))} /> Manual: one zone per storey from slab outlines</label>
       </div>
-      <SectionTitle icon={Icons.Ruler} title="Boundary reconstruction" info="Faces of neighbouring zones that face each other within these distances become paired interzone surfaces; everything else is classified by casting rays outward through the IFC elements." />
+      <SectionTitle icon={Icons.Layers} title="Zone surfaces" info="Second-level space boundaries (IfcRelSpaceBoundary2ndLevel) are the room surfaces the authoring tool computed. In Automatic, a space uses them only when they are complete: readable, on the IfcSpace body, normals pointing out of the space, closed, and area and volume within 2% of the body. Otherwise that space falls back to reconstruction and the Checks tab says why." />
+      <div className="radio-list" data-testid="boundary-source">
+        <label><input type="radio" disabled={bemOptions.zoning !== 'spaces'} checked={bemOptions.boundarySource === 'auto'} onChange={() => setBemOptions(o => ({ ...o, boundarySource: 'auto' }))} /> Automatic: the file's space boundaries where they are complete, reconstruction elsewhere</label>
+        <label><input type="radio" disabled={bemOptions.zoning !== 'spaces'} checked={bemOptions.boundarySource === 'ifc'} onChange={() => setBemOptions(o => ({ ...o, boundarySource: 'ifc' }))} /> The file's space boundaries, even where a completeness check fails <span className="muted">(reported)</span></label>
+        <label><input type="radio" checked={bemOptions.boundarySource === 'reconstructed' || bemOptions.zoning !== 'spaces'} onChange={() => setBemOptions(o => ({ ...o, boundarySource: 'reconstructed' }))} /> Reconstruct from IfcSpace bodies</label>
+      </div>
+      <SectionTitle icon={Icons.Ruler} title="Boundary reconstruction" info="For reconstructed zones (and IFC boundaries without a usable partner): faces of neighbouring zones that face each other within these distances become paired interzone surfaces; everything else is classified by casting rays outward through the IFC elements." />
       <div className="form-grid two">
         <Field label="Thickest wall (m)"><NumInput value={bemOptions.maxWallGap} min={0.05} max={2} onChange={v => v && setBemOptions(o => ({ ...o, maxWallGap: v }))} /></Field>
         <Field label="Thickest floor (m)"><NumInput value={bemOptions.maxSlabGap} min={0.05} max={3} onChange={v => v && setBemOptions(o => ({ ...o, maxSlabGap: v }))} /></Field>
@@ -76,6 +82,7 @@ function ConvertTab({ model, tm, bemOptions, setBemOptions, onConvert, convertin
           <StatTile label="Volume" value={fmt(tm.stats.volume, 0)} unit="m³" />
           <StatTile label="Surfaces" value={tm.stats.surfaces} sub={`${tm.stats.exterior} outdoor · ${tm.stats.ground} ground · ${tm.stats.interzonePairs} interzone pairs · ${tm.stats.adiabatic} adiabatic`} />
           <StatTile label="Windows" value={tm.stats.windows} sub={`${fmt(tm.stats.windowArea, 1)} m² · WWR ${tm.stats.exteriorWallArea ? fmt(100 * tm.stats.windowArea / (tm.stats.exteriorWallArea), 1) : '—'}%`} />
+          <StatTile label="Surface source" value={tm.boundaries && tm.boundaries.mode !== 'reconstructed' && tm.stats.zonesFromIfcBoundaries ? `${tm.stats.zonesFromIfcBoundaries} / ${tm.stats.zones}` : 'Reconstructed'} sub={tm.stats.zonesFromIfcBoundaries ? `zones from IfcRelSpaceBoundary · ${tm.boundaries.pairsFromIfc} pairs from CorrespondingBoundary` : tm.boundaries && tm.boundaries.secondLevel ? 'space boundaries in the file failed the checks' : tm.options.boundarySource === 'reconstructed' ? 'IFC space boundaries switched off' : 'no second-level space boundaries in the file'} />
           <StatTile label="Built in" value={fmt(tm.stats.buildMs, 0)} unit="ms" />
         </div>
       )}

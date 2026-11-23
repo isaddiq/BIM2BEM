@@ -61,7 +61,7 @@ try {
   await shot('01-start');
 
   step('open the BEM demo office');
-  await clickText('Try the BEM demo office');
+  await page.evaluate(() => [...document.querySelectorAll('.sample-card')].find(c => c.querySelector('h3')?.textContent.trim() === 'BEM demo office').querySelector('button').click());
   await page.waitForFunction(() => window.__viewer && document.querySelector('.file-chip'), { timeout: 90000 });
   await waitText('Opened BEMDemoOffice.ifc');
   await new Promise(r => setTimeout(r, 1500));
@@ -189,6 +189,30 @@ try {
   await clickText('Checks', '.subtabs button');
   await waitText('Accepted assumptions');
   await shot('13-revit-checks');
+
+  step('space boundaries: IfcRelSpaceBoundary2ndLevel as zone surfaces, then reconstruction');
+  await page.click('button[aria-label="More"]');
+  await clickText('Open sample: BEM demo office with space boundaries');
+  await waitText('Opened BEMDemoOffice-SB.ifc', 90000);
+  await clickTitle('BEM Conversion');
+  await clickText('Convert', '.subtabs button');
+  await page.waitForFunction(() => [...document.querySelectorAll('button')].some(x => x.textContent.includes('Build the energy model') && !x.disabled), { timeout: 60000 });
+  await clickText('Build the energy model');
+  await waitText('Energy model built', 60000);
+  await new Promise(r => setTimeout(r, 500));
+  const sbStats = await page.evaluate(() => document.querySelector('.stat-grid')?.innerText.replace(/\s+/g, ' ') || '');
+  console.log('  ifc boundaries:', sbStats.slice(0, 260));
+  if (!/Surface source 8 \/ 8/.test(sbStats) || !/12 pairs from CorrespondingBoundary/.test(sbStats) || !/467\.3/.test(sbStats)) throw new Error('Zone surfaces were not taken from the IFC space boundaries');
+  await shot('14-sb-convert');
+  await clickText('Checks', '.subtabs button');
+  await waitText("use the file's IfcRelSpaceBoundary2ndLevel geometry");
+  await clickText('Convert', '.subtabs button');
+  await page.evaluate(() => [...document.querySelectorAll('[data-testid=boundary-source] label')].find(l => l.textContent.includes('Reconstruct from IfcSpace bodies')).querySelector('input').click());
+  await clickText('Rebuild the energy model');
+  await page.waitForFunction(() => /Surface source Reconstructed/.test(document.querySelector('.stat-grid')?.innerText.replace(/\s+/g, ' ') || ''), { timeout: 60000 });
+  const recStats = await page.evaluate(() => document.querySelector('.stat-grid')?.innerText.replace(/\s+/g, ' ') || '');
+  console.log('  reconstructed:', recStats.slice(0, 260));
+  if (!/467\.3/.test(recStats) || !/12 interzone pairs/.test(recStats)) throw new Error('Reconstructed model differs from the IFC-boundary model');
 } catch (err) {
   failed = true;
   console.error('FAILED:', err.message);

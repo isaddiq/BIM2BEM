@@ -614,6 +614,167 @@ async function parseIfcBuffer(runtime, buffer, opts = {}) {
     return [x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]];
   }
 
+  // ---- Space boundaries (IfcRelSpaceBoundary / 1stLevel / 2ndLevel) ---------------------
+  // Affine placements as row-major 3×4 [R | t], metres, IFC project frame (Z up).
+  const M_ID = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0];
+  const mMul = (A, B) => {
+    const o = new Array(12).fill(0);
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) for (let k = 0; k < 3; k++) o[r * 4 + c] += A[r * 4 + k] * B[k * 4 + c];
+      o[r * 4 + 3] = A[r * 4] * B[3] + A[r * 4 + 1] * B[7] + A[r * 4 + 2] * B[11] + A[r * 4 + 3];
+    }
+    return o;
+  };
+  const mApply = (M, p) => [0, 1, 2].map(r => M[r * 4] * p[0] + M[r * 4 + 1] * p[1] + M[r * 4 + 2] * (p[2] || 0) + M[r * 4 + 3]);
+  const pointOf = (id) => { const c = asArray(getLine(id).Coordinates).map(val).map(Number); while (c.length < 3) c.push(0); return c.map(x => x * lengthUnit.scale); };
+  function axis2Matrix(id) {
+    if (id == null) return M_ID;
+    const ap = getLine(id);
+    const R = axis2Rotation(id);
+    const t = ap.Location != null ? pointOf(val(ap.Location)) : [0, 0, 0];
+    return [R[0], R[1], R[2], t[0], R[3], R[4], R[5], t[1], R[6], R[7], R[8], t[2]];
+  }
+  function placementMatrix(id, depth = 0) {
+    if (id == null) return M_ID;
+    if (depth > 64) return null;
+    const lp = getLine(id);
+    if (lp.type !== W.IFCLOCALPLACEMENT) return null; // grid and linear placements are not resolved
+    const local = axis2Matrix(val(lp.RelativePlacement));
+    const parent = lp.PlacementRelTo ? placementMatrix(val(lp.PlacementRelTo), depth + 1) : M_ID;
+    return local && parent ? mMul(parent, local) : null;
+  }
+  // Points of a boundary curve in its own frame (file units → metres).
+  function curvePoints(id) {
+    const c = getLine(id);
+    if (c.type === W.IFCPOLYLINE) return asArray(c.Points).map(p => pointOf(val(p)));
+    if (c.type === W.IFCPOLYLOOP) return asArray(c.Polygon).map(p => pointOf(val(p)));
+    if (W.IFCINDEXEDPOLYCURVE != null && c.type === W.IFCINDEXEDPOLYCURVE) {
+      const list = getLine(val(c.Points));
+      const coords = asArray(list.CoordList).map(row => { const r = asArray(row).map(val).map(Number); while (r.length < 3) r.push(0); return r.map(x => x * lengthUnit.scale); });
+      if (c.Segments == null) return coords;
+      const idx = [];
+      asArray(c.Segments).forEach(seg => asArray(seg && seg.value != null && Array.isArray(seg.value) ? seg.value : val(seg)).map(val).map(Number).forEach(i => { if (idx[idx.length - 1] !== i) idx.push(i); }));
+      if (!idx.length || idx.some(i => !(i >= 1 && i <= coords.length))) throw new Error('IfcIndexedPolyCurve segments could not be read');
+      return idx.map(i => coords[i - 1]);
+    }
+    if (c.type === W.IFCCOMPOSITECURVE) {
+      const out = [];
+      asArray(c.Segments).forEach(sid => {
+        const seg = getLine(val(sid));
+        let pts = curvePoints(val(seg.ParentCurve));
+        if (val(seg.SameSense) === false || String(val(seg.SameSense)).toUpperCase() === 'F') pts = pts.slice().reverse();
+        pts.forEach(p => { const q = out[out.length - 1]; if (!q || Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]) > 1e-9) out.push(p); });
+      });
+      return out;
+    }
+    throw new Error(`boundary curve ${codeToName.get(c.type) || c.type} is not supported (polylines, indexed poly curves and composite curves of them are)`);
+  }
+  const openRing = (pts) => {
+    const r = pts.slice();
+    if (r.length > 1) { const a = r[0], b = r[r.length - 1]; if (Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) < 1e-9) r.pop(); }
+    return r;
+  };
+  // Faces of the connection surface as { outer, inners } in the given placement's frame.
+  function faceBounds(faceId, M) {
+    const face = getLine(faceId);
+    let outer = null; const inners = [];
+    asArray(face.Bounds).forEach(bid => {
+      const b = getLine(val(bid));
+      let ring = openRing(curvePoints(val(b.Bound)).map(p => mApply(M, p)));
+      if (val(b.Orientation) === false || String(val(b.Orientation)).toUpperCase() === 'F') ring = ring.reverse();
+      if (b.type === W.IFCFACEOUTERBOUND && !outer) outer = ring; else inners.push(ring);
+    });
+    if (!outer && inners.length) outer = inners.shift();
+    return outer ? [{ outer, inners }] : [];
+  }
+  function surfacePolys(id, M) {
+    const s = getLine(id);
+    if (s.type === W.IFCCURVEBOUNDEDPLANE) {
+      const P = mMul(M, axis2Matrix(val(getLine(val(s.BasisSurface)).Position)));
+      const ring = (cid) => openRing(curvePoints(val(cid)).map(p => mApply(P, p)));
+      return [{ outer: ring(s.OuterBoundary), inners: asArray(s.InnerBoundaries).map(ring) }];
+    }
+    if (s.type === W.IFCFACEBASEDSURFACEMODEL) return asArray(s.FbsmFaces).flatMap(fs => asArray(getLine(val(fs)).CfsFaces).flatMap(fid => faceBounds(val(fid), M)));
+    if (s.type === W.IFCFACESURFACE || s.type === W.IFCFACE) return faceBounds(id, M);
+    throw new Error(`connection surface ${codeToName.get(s.type) || s.type} is not supported (IfcCurveBoundedPlane, IfcFaceBasedSurfaceModel and IfcFace are)`);
+  }
+  // web-ifc places meshes as coordination matrix × (IFC Z-up → Y-up) × placement; the
+  // coordination matrix (column-major) holds the COORDINATE_TO_ORIGIN shift in the Y-up
+  // frame. Boundary points get the same transform so they share the meshes' frame; the
+  // conversion then checks that they lie on the space body.
+  let coordMatrix = null;
+  try { const cm = api.GetCoordinationMatrix ? Array.from(api.GetCoordinationMatrix(modelID)) : null; if (cm && cm.length === 16) coordMatrix = cm; } catch { coordMatrix = null; }
+  const toViewer = (p) => {
+    const q = [p[0], p[2], -p[1]];
+    const m = coordMatrix;
+    if (!m) return q;
+    return [m[0] * q[0] + m[4] * q[1] + m[8] * q[2] + m[12], m[1] * q[0] + m[5] * q[1] + m[9] * q[2] + m[13], m[2] * q[0] + m[6] * q[1] + m[10] * q[2] + m[14]];
+  };
+
+  let sbCache = null;
+  /**
+   * Every IfcRelSpaceBoundary in the file with its geometry in the viewer frame (as the meshes).
+   * level: '2nd' (IfcRelSpaceBoundary2ndLevel, or an IFC2x3 boundary named/described as 2nd level),
+   * '1st', or 'unspecified'. A boundary whose geometry cannot be read keeps the reason in `error`.
+   */
+  async function readSpaceBoundaries() {
+    if (sbCache) return sbCache;
+    await ensureSecondaryData();
+    const seen = new Set();
+    const list = [];
+    const codes = [W.IFCRELSPACEBOUNDARY2NDLEVEL, W.IFCRELSPACEBOUNDARY1STLEVEL, W.IFCRELSPACEBOUNDARY].filter(c => c != null);
+    const placementOfSpace = new Map();
+    for (const code of codes) {
+      for (const relId of idsOfCode(code)) {
+        if (seen.has(relId)) continue;
+        seen.add(relId);
+        let rel;
+        try { rel = getLine(relId); } catch { continue; }
+        const name = String(val(rel.Name) || ''), desc = String(val(rel.Description) || '');
+        const level = rel.type === W.IFCRELSPACEBOUNDARY2NDLEVEL ? '2nd'
+          : rel.type === W.IFCRELSPACEBOUNDARY1STLEVEL ? '1st'
+            : /2nd\s*level/i.test(name) || /^2[ab]$/i.test(desc.trim()) ? '2nd' : /1st\s*level/i.test(name) ? '1st' : 'unspecified';
+        const spaceId = val(rel.RelatingSpace);
+        const elementId = val(rel.RelatedBuildingElement);
+        const rec = {
+          id: relId,
+          globalId: val(rel.GlobalId) || '',
+          ifcClass: codeToName.get(rel.type) || 'IfcRelSpaceBoundary',
+          level,
+          spaceId,
+          elementId: elementId != null ? elementId : null,
+          elementClass: elementId != null ? classOf(elementId) : null,
+          physical: String(val(rel.PhysicalOrVirtualBoundary) || 'NOTDEFINED').toUpperCase(),
+          ioe: String(val(rel.InternalOrExternalBoundary) || 'NOTDEFINED').toUpperCase(),
+          parentId: rel.ParentBoundary != null ? val(rel.ParentBoundary) : null,
+          correspondingId: rel.CorrespondingBoundary != null ? val(rel.CorrespondingBoundary) : null,
+          description: desc || null,
+          polys: [],
+          error: null,
+        };
+        try {
+          if (rel.ConnectionGeometry == null) throw new Error('no ConnectionGeometry');
+          const cg = getLine(val(rel.ConnectionGeometry));
+          if (cg.type !== W.IFCCONNECTIONSURFACEGEOMETRY) throw new Error(`${codeToName.get(cg.type) || 'connection geometry'} is not a surface`);
+          if (!placementOfSpace.has(spaceId)) placementOfSpace.set(spaceId, placementMatrix(val(getLine(spaceId).ObjectPlacement)));
+          const M = placementOfSpace.get(spaceId);
+          if (!M) throw new Error('the space placement is not an IfcLocalPlacement chain');
+          rec.polys = surfacePolys(val(cg.SurfaceOnRelatingElement), M).map(p => ({ outer: p.outer.map(toViewer), inners: p.inners.map(r => r.map(toViewer)) }));
+          if (!rec.polys.length || rec.polys.some(p => p.outer.length < 3)) throw new Error('the boundary polygon has fewer than three vertices');
+        } catch (err) {
+          rec.error = err.message || String(err);
+          rec.polys = [];
+        }
+        list.push(rec);
+        if (list.length % 500 === 0) await yieldUI();
+      }
+    }
+    const bySpace = new Map();
+    list.forEach(b => { if (!bySpace.has(b.spaceId)) bySpace.set(b.spaceId, []); bySpace.get(b.spaceId).push(b); });
+    sbCache = { boundaries: list, byId: new Map(list.map(b => [b.id, b])), bySpace, coordinationMatrix: !!coordMatrix };
+    return sbCache;
+  }
+
   const model = {
     elements,
     byId,
@@ -639,6 +800,7 @@ async function parseIfcBuffer(runtime, buffer, opts = {}) {
     secondaryReady: false,
     expandElement,
     elementAxes,
+    readSpaceBoundaries,
     close,
     _ensureSecondaryData: ensureSecondaryData,
   };

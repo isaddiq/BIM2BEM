@@ -25,7 +25,103 @@ const BEM_DEFAULTS = {
   materialMap: {},             // IFC material name → library material id (user decisions)
   excludedSpaces: [],          // IfcSpace express ids the user removed
   zoneOf: {},                  // IfcSpace express id → zone key (user merges)
+  boundarySource: 'auto',      // 'auto' | 'ifc' | 'reconstructed': IfcRelSpaceBoundary2ndLevel or IfcSpace bodies
+  boundaryTolerance: 0.02,     // auto: closure, area and volume agreement with the IfcSpace body (relative)
 };
+
+const SB_OPENING = /^Ifc(Window|Door|OpeningElement)/;
+const SB_RAY_DIR = v3.norm([0.5373, 0.6129, 0.5793]); // generic direction for point-in-mesh parity
+
+function pointInMesh(p, P, I) {
+  let n = 0;
+  for (let t = 0; t < I.length; t += 3) if (rayTri(p, SB_RAY_DIR, P[I[t]], P[I[t + 1]], P[I[t + 2]]) != null) n++;
+  return n % 2 === 1;
+}
+
+/**
+ * Can this space use the file's second-level boundaries? Converts them to the EP frame and
+ * checks them against the IfcSpace body: geometry readable, planar, on the body (within 5 cm
+ * of its bounding box), each normal pointing out of the space (point-in-mesh test 5 cm either
+ * side), closed (area-vector imbalance), and total area and enclosed volume within `tol` of
+ * the body. Returns faces/openings in EP coordinates plus the check values and, if a check
+ * fails, the reason.
+ */
+function evaluateSpaceBoundaries(list, mesh, meshArea, shift, mode, tol) {
+  const out = { use: false, reason: null, faces: [], openings: [], checks: {}, notes: [] };
+  const second = list.filter(b => b.level === '2nd');
+  if (!list.length) { out.reason = 'no IfcRelSpaceBoundary for this space'; out.none = true; return out; }
+  if (!second.length) { out.reason = `only ${[...new Set(list.map(b => b.level === '1st' ? 'first-level' : 'unspecified-level'))].join(' and ')} boundaries, which do not describe zone surfaces`; out.none = true; return out; }
+  const broken = second.filter(b => b.error);
+  if (broken.length) { out.reason = `${broken.length} boundary geometr${broken.length > 1 ? 'ies' : 'y'} could not be read (${broken[0].error})`; return out; }
+  const ep = (p) => { const q = toEP(p[0], p[1], p[2]); return [q[0] - shift[0], q[1] - shift[1], q[2] - shift[2]]; };
+  const ids = new Set(second.map(b => b.id));
+  const isOpening = (b) => SB_OPENING.test(b.elementClass || '') || (b.parentId != null && ids.has(b.parentId));
+  const bb = bboxOf(mesh.P);
+  let maxOff = 0, nonPlanar = 0, tiny = 0;
+  const faces = [];
+  second.forEach(b => b.polys.forEach((poly, k) => {
+    let verts = poly.outer.map(ep);
+    const area = polyArea3(verts);
+    if (area < 0.01) { tiny++; return; }
+    const n = polyNormal3(verts);
+    const d0 = v3.dot(n, verts[0]);
+    verts.forEach(p => {
+      nonPlanar = Math.max(nonPlanar, Math.abs(v3.dot(n, p) - d0));
+      for (let a = 0; a < 3; a++) maxOff = Math.max(maxOff, bb.min[a] - p[a], p[a] - bb.max[a]);
+    });
+    const inners = poly.inners.map(r => r.map(ep));
+    (isOpening(b) ? out.openings : faces).push({ sb: b, poly: k, verts, inners, normal: n, area });
+  }));
+  if (!faces.length) { out.reason = 'no boundary polygons with area'; return out; }
+  if (nonPlanar > 0.01) { out.reason = `a boundary polygon is not planar (${(nonPlanar * 100).toFixed(1)} cm out of plane)`; return out; }
+  if (maxOff > 0.05) { out.reason = `boundary geometry does not lie on the IfcSpace body (up to ${maxOff.toFixed(2)} m outside it); placement or units may differ`; return out; }
+  // Orientation per face.
+  const delta = 0.05;
+  let outward = 0, inward = 0, unclear = 0;
+  faces.forEach(f => {
+    const c = polyCentroid3(f.verts);
+    const inBehind = pointInMesh(v3.sub(c, v3.scale(f.normal, delta)), mesh.P, mesh.I);
+    const inFront = pointInMesh(v3.add(c, v3.scale(f.normal, delta)), mesh.P, mesh.I);
+    f.orient = inBehind && !inFront ? 1 : !inBehind && inFront ? -1 : 0;
+    if (f.orient > 0) outward++; else if (f.orient < 0) inward++; else unclear++;
+  });
+  const flipFace = (f) => { f.verts = f.verts.slice().reverse(); f.inners = f.inners.map(r => r.slice().reverse()); f.normal = v3.scale(f.normal, -1); };
+  const flipOpening = (o, n) => { if (v3.dot(o.normal, n) < 0) { o.verts = o.verts.slice().reverse(); o.normal = v3.scale(o.normal, -1); } };
+  const consistent = unclear === 0 && (inward === 0 || outward === 0);
+  if (unclear) out.notes.push(`${unclear} boundary normal(s) could not be checked against the IfcSpace body`);
+  if (consistent && inward) { faces.forEach(flipFace); out.notes.push('all boundary normals pointed into the space and were reversed'); }
+  else if (!consistent && mode === 'ifc' && unclear === 0) { faces.filter(f => f.orient < 0).forEach(flipFace); out.notes.push(`${inward} of ${faces.length} boundary normals pointed into the space and were reversed`); }
+  // Openings take their parent's orientation.
+  out.openings.forEach(o => {
+    const parent = faces.find(f => f.sb.id === o.sb.parentId) || faces.filter(f => Math.abs(v3.dot(f.normal, o.normal)) > 0.999).sort((x, y) => Math.abs(v3.dot(x.normal, v3.sub(o.verts[0], x.verts[0]))) - Math.abs(v3.dot(y.normal, v3.sub(o.verts[0], y.verts[0]))))[0];
+    if (parent) { o.parentFace = parent; flipOpening(o, parent.normal); }
+  });
+  const sumVec = faces.reduce((s, f) => v3.add(s, v3.scale(f.normal, f.area)), [0, 0, 0]);
+  const totalA = faces.reduce((s, f) => s + f.area, 0);
+  const volume = faces.reduce((s, f) => s + v3.dot(polyCentroid3(f.verts), f.normal) * f.area, 0) / 3;
+  const meshVol = Math.abs(meshVolume(mesh.P, mesh.I));
+  out.checks = {
+    boundaries: second.length, faces: faces.length, openings: out.openings.length,
+    closure: totalA > 0 ? v3.len(sumVec) / totalA : 1,
+    area: totalA, bodyArea: meshArea, areaDiff: meshArea > 0 ? (totalA - meshArea) / meshArea : 1,
+    volume, bodyVolume: meshVol, volumeDiff: meshVol > 0 ? (volume - meshVol) / meshVol : 1,
+    normals: consistent ? 'outward' + (inward ? ' (reversed)' : '') : `${inward} of ${faces.length} inward${unclear ? `, ${unclear} unclear` : ''}`,
+    tiny,
+  };
+  const c = out.checks;
+  const fails = [];
+  if (!consistent) fails.push(`normals are inconsistent (${c.normals})`);
+  if (c.closure > tol) fails.push(`not closed (area imbalance ${(c.closure * 100).toFixed(1)}%)`);
+  if (Math.abs(c.areaDiff) > tol) fails.push(`surface area ${(c.areaDiff * 100).toFixed(1)}% different from the IfcSpace body`);
+  if (Math.abs(c.volumeDiff) > tol) fails.push(`enclosed volume ${(c.volumeDiff * 100).toFixed(1)}% different from the IfcSpace body`);
+  out.faces = faces;
+  out.volume = volume;
+  if (!fails.length) { out.use = true; return out; }
+  out.reason = fails.join('; ');
+  // 'ifc': use the file's boundaries anyway when every normal could be oriented.
+  if (mode === 'ifc' && unclear === 0) { out.use = true; out.forced = true; }
+  return out;
+}
 
 const ENVELOPE_SKIP = /^Ifc(Space|Opening|VoidingFeature|Furnishing|Furniture|SystemFurniture|Annotation|VirtualElement|Site|GeographicElement|BuildingElementProxy|TransportElement|Railing|Distribution|Flow|Duct|Pipe|Cable|Air|Outlet|Switching|LightFixture|Lamp|Sensor|Actuator|Controller|Alarm|Electric|Junction|Sanitary|SpaceHeater|Pump|Fan|Valve|Tank|Boiler|Chiller|Coil|Damper|Unitary|Protective|EnergyConversion|AudioVisual|Communications|FireSuppression|Stack|Waste|Medical|Compressor|Condenser|Cool|Evapor|HeatExchanger|Humidifier|Interceptor|Filter|Burner|Engine|TubeBundle|Solar|Transformer|Motor|DiscreteAccessory|Fastener|MechanicalFastener|Reinforcing|Tendon|Footing|Pile)/;
 
@@ -173,10 +269,16 @@ async function buildThermalModel(model, options = {}) {
     return { zones: [], surfaces: [], subsurfaces: [], constructions: new Map(), windowTypes: new Map(), mapping: new Map(), issues, northAngle, shift, options: opts };
   }
 
-  // ---- Zones and their boundary faces -----------------------------------------------------
-  const namer = makeNamer();
-  const zones = new Map();
-  const faces = []; // candidate surfaces
+  // ---- Boundary source per space: IfcRelSpaceBoundary2ndLevel or the IfcSpace body ------------
+  const sbMode = opts.zoning === 'spaces' ? (opts.boundarySource || 'auto') : 'reconstructed';
+  const boundaryReport = { mode: sbMode, inFile: 0, secondLevel: 0, spaces: [] };
+  let sbData = null;
+  if (sbMode !== 'reconstructed' && typeof model.readSpaceBoundaries === 'function') {
+    sbData = await model.readSpaceBoundaries();
+    boundaryReport.inFile = sbData.boundaries.length;
+    boundaryReport.secondLevel = sbData.boundaries.filter(b => b.level === '2nd').length;
+  }
+  const prepared = new Map(); // source → { mesh, fs, plan }
   sources.forEach(src => {
     const mesh = src.mesh || elementMeshEP(src.el, shift);
     let { P, I } = mesh;
@@ -186,12 +288,50 @@ async function buildThermalModel(model, options = {}) {
       for (let t = 0; t < I.length; t += 3) { J[t] = I[t]; J[t + 1] = I[t + 2]; J[t + 2] = I[t + 1]; }
       I = J; vol = -vol;
     }
-    const zoneKey = src.spaceId != null ? (opts.zoneOf[src.spaceId] || `z${src.spaceId}`) : `st${src.storeyZone}-${faces.length}`;
     const fs = meshPlanarFaces(P, I);
+    let plan = null;
+    if (sbData && src.spaceId != null) {
+      plan = evaluateSpaceBoundaries(sbData.bySpace.get(src.spaceId) || [], { P, I }, fs.reduce((s, f) => s + f.area, 0), shift, sbMode, opts.boundaryTolerance);
+      boundaryReport.spaces.push({ spaceId: src.spaceId, globalId: src.el.globalId, name: elementLabel(src.el), source: plan.use ? 'IfcRelSpaceBoundary' : 'IfcSpace body', none: !!plan.none, forced: !!plan.forced, reason: plan.reason, notes: plan.notes, checks: plan.checks });
+    }
+    prepared.set(src, { P, I, vol, fs, plan });
+  });
+  if (sbData) {
+    const used = boundaryReport.spaces.filter(s => s.source === 'IfcRelSpaceBoundary');
+    const fell = boundaryReport.spaces.filter(s => s.source !== 'IfcRelSpaceBoundary' && !s.none);
+    const without = boundaryReport.spaces.filter(s => s.none);
+    if (boundaryReport.secondLevel && without.length) issue('warning', 'sb-missing', `${without.length} zone(s) have no second-level space boundaries in the file (${without.slice(0, 4).map(s => s.name).join(', ')}${without.length > 4 ? ', …' : ''}); their surfaces are reconstructed from the IfcSpace bodies.`, { ids: without.map(s => s.spaceId) });
+    if (!boundaryReport.secondLevel) {
+      if (sbMode === 'ifc') issue('warning', 'sb-none', `IFC space boundaries were requested, but the file has no second-level space boundaries${boundaryReport.inFile ? ` (it has ${boundaryReport.inFile} first-level or unspecified ones)` : ''}. All zone surfaces are reconstructed from the IfcSpace bodies.`);
+    } else {
+      fell.forEach(s => issue('warning', 'sb-fallback', `${s.name}: the file's IfcRelSpaceBoundary geometry is not used because ${s.reason}. Its surfaces are reconstructed from the IfcSpace body.`, { ids: [s.spaceId] }));
+      const forced = used.filter(s => s.forced);
+      forced.forEach(s => issue('warning', 'sb-forced', `${s.name}: IFC space boundaries are used as requested although ${s.reason}.`, { ids: [s.spaceId] }));
+      const clean = used.filter(s => !s.forced);
+      if (clean.length) {
+        const worst = (k) => Math.max(...clean.map(s => Math.abs(s.checks[k])));
+        issue('verified', 'check', `${clean.length} of ${boundaryReport.spaces.length} zones use the file's IfcRelSpaceBoundary2ndLevel geometry: each closed (worst imbalance ${(worst('closure') * 100).toFixed(2)}%), normals pointing out of the space, area and volume within ${(worst('areaDiff') * 100).toFixed(2)}% and ${(worst('volumeDiff') * 100).toFixed(2)}% of the IfcSpace body (tolerance ${(opts.boundaryTolerance * 100).toFixed(0)}%).`);
+      }
+      const noted = used.filter(s => s.notes && s.notes.length);
+      noted.forEach(s => issue('assumption', 'sb-normals', `${s.name}: ${s.notes.join('; ')}.`, { ids: [s.spaceId] }));
+    }
+  }
+
+  // ---- Zones and their boundary faces -----------------------------------------------------
+  const namer = makeNamer();
+  const zones = new Map();
+  const faces = []; // candidate surfaces
+  const sbOpenings = []; // window/door boundaries of zones that use IFC boundaries
+  sources.forEach(src => {
+    const { P, I, fs, plan } = prepared.get(src);
+    let vol = prepared.get(src).vol;
+    const useSb = !!(plan && plan.use);
+    const zoneKey = src.spaceId != null ? (opts.zoneOf[src.spaceId] || `z${src.spaceId}`) : `st${src.storeyZone}-${faces.length}`;
     // Closure: the outward area vectors of a closed solid sum to zero.
     const sumVec = fs.reduce((s, f) => v3.add(s, v3.scale(f.normal, f.area)), [0, 0, 0]);
     const totalA = fs.reduce((s, f) => s + f.area, 0);
-    const closure = totalA > 0 ? v3.len(sumVec) / totalA : 1;
+    let closure = totalA > 0 ? v3.len(sumVec) / totalA : 1;
+    if (useSb) { vol = plan.volume; closure = plan.checks.closure; }
     const bb = bboxOf(P);
     let z = zones.get(zoneKey);
     if (!z) {
@@ -204,9 +344,22 @@ async function buildThermalModel(model, options = {}) {
     z.closure = Math.max(z.closure, closure);
     for (let k = 0; k < 3; k++) { z.bbox.min[k] = Math.min(z.bbox.min[k], bb.min[k]); z.bbox.max[k] = Math.max(z.bbox.max[k], bb.max[k]); }
     if (closure > 0.02) issue('warning', 'zone-open', `${z.name} is not a closed solid (area imbalance ${(closure * 100).toFixed(1)}%). Its volume and boundaries may be wrong.`, { ids: z.spaceIds.slice(), zones: [zoneKey] });
-    fs.forEach(f => f.rings.forEach(ring => {
-      faces.push({ zoneKey, spaceId: src.spaceId, normal: f.normal, origin: f.origin, basis: f.basis, kind: surfaceKind(f.normal), rem: [[ring.map(p => p.slice())]], parts: [] });
-    }));
+    z.boundarySource = useSb ? 'IfcRelSpaceBoundary' : z.boundarySource || (src.spaceId != null ? 'IfcSpace body' : 'storey prism');
+    if (useSb) {
+      plan.faces.forEach(bf => {
+        const basis = planeBasis(bf.normal);
+        const origin = bf.verts[0];
+        let ring = cleanRing(bf.verts.map(p => to2D(p, origin, basis)));
+        if (ring.length < 3) return;
+        if (ringArea2(ring) < 0) ring = ring.reverse();
+        faces.push({ zoneKey, spaceId: src.spaceId, normal: bf.normal, origin, basis, kind: surfaceKind(bf.normal), rem: [[ring]], parts: [], sb: bf.sb, sbArea: bf.area });
+      });
+      plan.openings.forEach(o => sbOpenings.push({ ...o, zoneKey, spaceId: src.spaceId }));
+    } else {
+      fs.forEach(f => f.rings.forEach(ring => {
+        faces.push({ zoneKey, spaceId: src.spaceId, normal: f.normal, origin: f.origin, basis: f.basis, kind: surfaceKind(f.normal), rem: [[ring.map(p => p.slice())]], parts: [] });
+      }));
+    }
   });
 
   // 3D bounding boxes per face (for candidate pruning).
@@ -217,11 +370,56 @@ async function buildThermalModel(model, options = {}) {
   });
 
   // ---- Interzone matching -------------------------------------------------------------------
+  const mapPoly = (mp, from, to) => mp.map(poly => poly.map(ring => ring.map(q => to2D(to3D(q, from.origin, from.basis), to.origin, to.basis))));
+  let matchedPairs = 0;
+  const matchPair = ({ a, b, gap, how }) => {
+    if (!a.rem.length || !b.rem.length) return 0;
+    let inter;
+    try { inter = mpIntersect(a.rem, mapPoly(b.rem, b, a)); } catch { return 0; }
+    if (mpArea(inter) < 0.05) return 0;
+    const rings = multiToRings(inter, 0.05);
+    if (!rings.length) return 0;
+    try {
+      a.rem = mpDiff(a.rem, inter);
+      b.rem = mpDiff(b.rem, mapPoly(inter, a, b));
+    } catch { return 0; }
+    rings.forEach(r => {
+      const id = `p${++matchedPairs}`;
+      const rb = r.map(q => to2D(to3D(q, a.origin, a.basis), b.origin, b.basis));
+      a.parts.push({ ring: r, bc: 'Surface', pairId: id, side: 'a', gap, how });
+      b.parts.push({ ring: ringArea2(rb) < 0 ? rb.reverse() : rb, bc: 'Surface', pairId: id, side: 'b', gap, how });
+    });
+    return rings.reduce((t, r) => t + Math.abs(ringArea2(r)), 0);
+  };
+
+  // Pairs the file declares (IfcRelSpaceBoundary2ndLevel.CorrespondingBoundary), when both
+  // spaces use their IFC boundaries. The common area is the overlap of the two polygons.
+  const faceOfSb = new Map();
+  faces.forEach(f => { if (f.sb && !faceOfSb.has(f.sb.id)) faceOfSb.set(f.sb.id, f); });
+  let sbPairs = 0, sbPairMismatch = 0, sbPairMissing = 0;
+  faces.forEach(a => {
+    if (!a.sb || a.sb.correspondingId == null) return;
+    const b = faceOfSb.get(a.sb.correspondingId);
+    if (!b) { sbPairMissing++; return; }
+    if (b.sbDone || a.sbDone || b === a) return;
+    if (b.sb.correspondingId != null && b.sb.correspondingId !== a.sb.id) return;
+    a.sbDone = b.sbDone = true;
+    const gap = -b.plane - a.plane;
+    const got = matchPair({ a, b, gap, how: 'ifc' });
+    if (got > 0) { sbPairs++; a.sbPaired = b.sbPaired = true; }
+    if (got < 0.98 * Math.min(a.sbArea, b.sbArea)) sbPairMismatch++;
+  });
+  if (sbPairMismatch) issue('warning', 'sb-pair-mismatch', `${sbPairMismatch} pair(s) of corresponding IFC space boundaries overlap by less than 98% of their area; the remainder is matched geometrically or classified by the ray test.`);
+
   const pairs = [];
+  // Faces whose boundary condition the file states (paired, or external) are not matched again.
+  const geoCandidate = (f) => !(f.sb && (f.sbPaired || /^EXTERNAL/.test(f.sb.ioe)));
   for (let i = 0; i < faces.length; i++) {
     const a = faces[i];
+    if (!geoCandidate(a)) continue;
     for (let j = i + 1; j < faces.length; j++) {
       const b = faces[j];
+      if (!geoCandidate(b)) continue;
       if (a.spaceId != null && a.spaceId === b.spaceId) continue;
       if (a.zoneKey === b.zoneKey && a.spaceId == null) continue;
       if (v3.dot(a.normal, b.normal) > -0.985) continue;
@@ -234,29 +432,7 @@ async function buildThermalModel(model, options = {}) {
     }
   }
   pairs.sort((p, q) => p.gap - q.gap);
-  const mapPoly = (mp, from, to) => mp.map(poly => poly.map(ring => {
-    let r = ring.map(q => to2D(to3D(q, from.origin, from.basis), to.origin, to.basis));
-    return r;
-  }));
-  let matchedPairs = 0;
-  pairs.forEach(({ a, b, gap }) => {
-    if (!a.rem.length || !b.rem.length) return;
-    let inter;
-    try { inter = mpIntersect(a.rem, mapPoly(b.rem, b, a)); } catch { return; }
-    if (mpArea(inter) < 0.05) return;
-    const rings = multiToRings(inter, 0.05);
-    if (!rings.length) return;
-    try {
-      a.rem = mpDiff(a.rem, inter);
-      b.rem = mpDiff(b.rem, mapPoly(inter, a, b));
-    } catch { return; }
-    rings.forEach(r => {
-      const id = `p${++matchedPairs}`;
-      const rb = r.map(q => to2D(to3D(q, a.origin, a.basis), b.origin, b.basis));
-      a.parts.push({ ring: r, bc: 'Surface', pairId: id, side: 'a', gap });
-      b.parts.push({ ring: ringArea2(rb) < 0 ? rb.reverse() : rb, bc: 'Surface', pairId: id, side: 'b', gap });
-    });
-  });
+  pairs.forEach(p => matchPair({ ...p, how: 'geometric' }));
 
   // ---- Ray model of the building fabric ----------------------------------------------------
   const rayEls = [];
@@ -307,6 +483,15 @@ async function buildThermalModel(model, options = {}) {
   // ---- Surfaces --------------------------------------------------------------------------------
   const surfaces = [];
   const byPair = new Map();
+  const sbConflicts = [];
+  const sbOther = new Set();
+  const reportBySpace = new Map(boundaryReport.spaces.map(s => [s.spaceId, s]));
+  const reconstructedWhy = (spaceId) => {
+    if (sbMode === 'reconstructed') return 'IFC space boundaries switched off in the settings';
+    const r = reportBySpace.get(spaceId);
+    if (!r || r.none) return 'the file has no usable IfcRelSpaceBoundary geometry for this space';
+    return `the file's space boundaries failed the checks: ${r.reason}`;
+  };
   faces.forEach(f => {
     multiToRings(f.rem, 0.05).forEach(r => f.parts.push({ ring: r, bc: null }));
     f.parts.forEach(part => {
@@ -320,11 +505,31 @@ async function buildThermalModel(model, options = {}) {
       const minZ = Math.min(...verts.map(p => p[2]));
       const maxZ = Math.max(...verts.map(p => p[2]));
       if (bc === 'Surface') {
-        provenance.boundary = `Facing surface of another zone ${part.gap.toFixed(2)} m away (geometric match)`;
-        // Elements between the two zones.
-        const c = polyCentroid3(verts);
-        castRay(v3.add(c, v3.scale(f.normal, 0.002)), f.normal, part.gap + 0.05).filter(h => !h.isSpace).forEach(h => { if (!sourceIds.includes(h.id)) sourceIds.push(h.id); });
-        if (type === 'Ceiling') type = 'Ceiling';
+        provenance.boundary = part.how === 'ifc'
+          ? `IfcRelSpaceBoundary2ndLevel.CorrespondingBoundary: paired with the boundary of another zone ${part.gap.toFixed(2)} m away`
+          : `Facing surface of another zone ${part.gap.toFixed(2)} m away (geometric match)`;
+        if (f.sb && f.sb.elementId != null) sourceIds.push(f.sb.elementId);
+        else {
+          // Elements between the two zones.
+          const c = polyCentroid3(verts);
+          castRay(v3.add(c, v3.scale(f.normal, 0.002)), f.normal, part.gap + 0.05).filter(h => !h.isSpace).forEach(h => { if (!sourceIds.includes(h.id)) sourceIds.push(h.id); });
+        }
+      } else if (f.sb && f.sb.ioe !== 'NOTDEFINED') {
+        // The file states the boundary condition; the ray test cross-checks it.
+        const cl = classify(f, part.ring);
+        const ioe = f.sb.ioe;
+        sourceIds = f.sb.elementId != null ? [f.sb.elementId] : cl.sources;
+        if (ioe === 'EXTERNAL_EARTH') bc = 'Ground';
+        else if (ioe === 'EXTERNAL') bc = f.kind === 'Floor' && maxZ <= gradeZ ? 'Ground' : 'Outdoors';
+        else bc = 'Unmodelled'; // INTERNAL without a modelled zone behind it, EXTERNAL_FIRE, EXTERNAL_WATER
+        provenance.boundary = `IfcRelSpaceBoundary InternalOrExternalBoundary = ${ioe}${ioe === 'EXTERNAL' && bc === 'Ground' ? ' (lowest floor, taken as on grade)' : ''}${bc === 'Unmodelled' && ioe === 'INTERNAL' ? '; no modelled zone on the other side' : ''}; ray test ${Math.round(cl.share * 100)}% exterior`;
+        const declaredOut = bc === 'Outdoors' || bc === 'Ground';
+        if ((declaredOut && cl.share < 0.5) || (!declaredOut && cl.exterior && ioe === 'INTERNAL')) {
+          sbConflicts.push({ zoneKey: f.zoneKey, ioe, share: cl.share, elementId: f.sb.elementId });
+          provenance.boundary += ' (disagrees with the IFC declaration, which is used)';
+        }
+        if (ioe === 'EXTERNAL_WATER' || ioe === 'EXTERNAL_FIRE') sbOther.add(ioe);
+        if (type === 'Ceiling' && bc === 'Outdoors') type = 'Roof';
       } else {
         const cl = classify(f, part.ring);
         sourceIds = cl.sources;
@@ -360,7 +565,10 @@ async function buildThermalModel(model, options = {}) {
         tilt: tz.tilt, azimuth: tz.azimuth,
         minZ, maxZ,
         sourceIds,
-        provenance: { geometry: zone.source === 'IfcSpace' ? 'Planar face of the IfcSpace body (reconstructed; the file has no usable IfcRelSpaceBoundary geometry)' : 'Face of the storey zone prism', ...provenance },
+        provenance: { geometry: f.sb ? `${f.sb.ifcClass} ${f.sb.globalId}: boundary polygon from the IFC file` : zone.source === 'IfcSpace' ? `Planar face of the IfcSpace body (reconstructed; ${reconstructedWhy(f.spaceId)})` : 'Face of the storey zone prism', ...provenance },
+        boundarySource: f.sb ? 'IfcRelSpaceBoundary' : zone.source === 'IfcSpace' ? 'IfcSpace body' : 'storey prism',
+        sbId: f.sb ? f.sb.id : null,
+        sbGlobalId: f.sb ? f.sb.globalId : null,
         subsurfaceIds: [],
       };
       surfaces.push(s);
@@ -375,6 +583,12 @@ async function buildThermalModel(model, options = {}) {
     const ids = [...new Set([...list[0].sourceIds, ...list[1].sourceIds])];
     list[0].sourceIds = ids; list[1].sourceIds = ids;
   });
+
+  if (sbConflicts.length) issue('warning', 'sb-bc-conflict', `${sbConflicts.length} IFC space boundar${sbConflicts.length > 1 ? 'ies disagree' : 'y disagrees'} with the ray test about whether it faces outside (for example ${sbConflicts[0].ioe} where the ray test finds ${Math.round(sbConflicts[0].share * 100)}% exterior). The IFC declaration is used.`, { ids: [...new Set(sbConflicts.map(c => c.elementId).filter(x => x != null))], zones: [...new Set(sbConflicts.map(c => c.zoneKey))] });
+  if (sbOther.size) issue('assumption', 'sb-external-other', `Space boundaries declared ${[...sbOther].join(' / ')} (next to water or a neighbouring building) are treated like faces next to unzoned building parts.`);
+  boundaryReport.pairsFromIfc = sbPairs;
+  boundaryReport.pairsMissingPartner = sbPairMissing;
+  boundaryReport.bcConflicts = sbConflicts.length;
 
   // Unmodelled neighbours: adiabatic or outdoors, as the user chose.
   const unm = surfaces.filter(s => s.bc === 'Unmodelled');
@@ -414,7 +628,60 @@ async function buildThermalModel(model, options = {}) {
   nr.voids.forEach((ops, host) => ops.forEach(op => { const f = openingToFiller.get(op); if (f != null) hostOfOpening.set(f, host); }));
   let skippedInterior = 0;
   const skipped = [];
+  // Openings from the file's window/door boundaries (zones that use IFC boundaries). The
+  // opening polygon must be a rectangle in its host surface; otherwise the element is placed
+  // by projecting its body, as for reconstructed zones.
+  const placedFromSb = new Set();
+  const sbOpeningProblems = [];
+  sbOpenings.forEach(o => {
+    const el = o.sb.elementId != null ? model.byId.get(o.sb.elementId) : null;
+    if (!el || !/^Ifc(Window|Door)/.test(el.ifcClass) || placedFromSb.has(el.expressId)) return;
+    const isDoor = /^IfcDoor/.test(el.ifcClass);
+    const hosts = surfaces.filter(s => s.zoneKey === o.zoneKey && (s.sbId === o.sb.parentId || (o.parentFace && s.sbId === o.parentFace.sb.id)) && v3.dot(s.normal, o.normal) > 0.999);
+    let placed = null;
+    for (const s of hosts) {
+      const b = planeBasis(s.normal);
+      const org = s.vertices[0];
+      if (Math.abs(v3.dot(v3.sub(o.verts[0], org), s.normal)) > 0.02) continue;
+      const q = o.verts.map(p => to2D(p, org, b));
+      const us = q.map(x => x[0]), ws = q.map(x => x[1]);
+      const rect = [Math.min(...us), Math.max(...us), Math.min(...ws), Math.max(...ws)];
+      const ra = (rect[1] - rect[0]) * (rect[3] - rect[2]);
+      if (!(ra > 0.0025) || Math.abs(Math.abs(ringArea2(q)) - ra) > 0.01 * ra) { sbOpeningProblems.push(`${elementLabel(el)} is not a rectangle aligned with its wall`); placed = 'skip'; break; }
+      const ring = s.vertices.map(p => to2D(p, org, b));
+      const corners = [[rect[0], rect[3]], [rect[0], rect[2]], [rect[1], rect[2]], [rect[1], rect[3]]];
+      const inset = (p) => [p[0] + (p[0] === rect[0] ? 1e-3 : -1e-3), p[1] + (p[1] === rect[2] ? 1e-3 : -1e-3)];
+      if (!corners.every(p => pointInRing(inset(p), ring))) continue;
+      placed = { s, b, org, rect, ra };
+      break;
+    }
+    if (placed === 'skip') return;
+    if (!placed) { sbOpeningProblems.push(`${elementLabel(el)} lies outside its host boundary`); return; }
+    const { s, rect } = placed;
+    placedFromSb.add(el.expressId);
+    if (s.bc !== 'Outdoors' && (!isDoor || !opts.includeInteriorDoors)) { skippedInterior++; return; }
+    const [u0, u1, w0, w1] = rect;
+    const overlapping = s.subsurfaceIds.map(id => subsurfaces.find(x => x.id === id)).some(x => !(u1 <= x.rect[0] + 1e-3 || u0 >= x.rect[1] - 1e-3 || w1 <= x.rect[2] + 1e-3 || w0 >= x.rect[3] - 1e-3));
+    if (overlapping) { skipped.push(el.expressId); return; }
+    const verts = [[u0, w1], [u0, w0], [u1, w0], [u1, w1]].map(p => to3D(p, placed.org, placed.b).map(x => Math.round(x * 1e4) / 1e4));
+    const sub = {
+      id: `w${subsurfaces.length + 1}`,
+      name: namer(`${s.name} ${isDoor ? 'Door' : 'Window'} ${elementLabel(el)}`),
+      hostId: s.id,
+      type: isDoor ? 'Door' : 'Window',
+      vertices: verts,
+      rect: [u0, u1, w0, w1],
+      area: (u1 - u0) * (w1 - w0),
+      sourceId: el.expressId,
+      sbGlobalId: o.sb.globalId,
+      provenance: { geometry: `${o.sb.ifcClass} ${o.sb.globalId}: opening boundary from the IFC file, in the plane of its host boundary${o.sb.parentId != null ? ' (ParentBoundary)' : ''}` },
+    };
+    subsurfaces.push(sub);
+    s.subsurfaceIds.push(sub.id);
+  });
+  if (sbOpeningProblems.length) issue('warning', 'sb-openings', `${sbOpeningProblems.length} opening boundar${sbOpeningProblems.length > 1 ? 'ies' : 'y'} could not be used (${sbOpeningProblems.slice(0, 3).join('; ')}${sbOpeningProblems.length > 3 ? '; …' : ''}); those windows/doors are placed by projecting their bodies.`);
   openingsEls.forEach(el => {
+    if (placedFromSb.has(el.expressId)) return;
     const isDoor = /^IfcDoor/.test(el.ifcClass);
     const { P } = elementMeshEP(el, shift);
     const c = P.reduce((s, p) => v3.add(s, p), [0, 0, 0]).map(x => x / P.length);
@@ -688,6 +955,7 @@ async function buildThermalModel(model, options = {}) {
     northAngle,
     shift,
     options: opts,
+    boundaries: boundaryReport,
     stats: {
       zones: zoneList.length,
       surfaces: surfaces.length,
@@ -701,6 +969,8 @@ async function buildThermalModel(model, options = {}) {
       volume: zoneList.reduce((t, z) => t + z.volume, 0),
       windowArea: subsurfaces.filter(w => w.type === 'Window').reduce((t, w) => t + w.area, 0),
       exteriorWallArea: surfaces.filter(s => s.bc === 'Outdoors' && s.type === 'Wall').reduce((t, s) => t + s.area, 0),
+      zonesFromIfcBoundaries: zoneList.filter(z => z.boundarySource === 'IfcRelSpaceBoundary').length,
+      surfacesFromIfcBoundaries: surfaces.filter(s => s.boundarySource === 'IfcRelSpaceBoundary').length,
       buildMs: t1 - t0,
     },
   };
@@ -718,17 +988,17 @@ function mappingRows(tm, model) {
   tm.mapping.forEach((m, id) => {
     const el = model.byId.get(id);
     const base = { ifcExpressId: id, ifcGlobalId: el ? el.globalId : '', ifcClass: el ? el.ifcClass : '', ifcName: el ? elementLabelSafe(el) : '' };
-    m.zones.forEach(k => { const z = tm.zoneByKey.get(k); rows.push({ ...base, bemObject: 'Zone', bemName: z.name, zone: z.name, boundary: '', construction: '', area: +z.floorArea.toFixed(3), uValue: '' }); });
+    m.zones.forEach(k => { const z = tm.zoneByKey.get(k); rows.push({ ...base, bemObject: 'Zone', bemName: z.name, zone: z.name, boundary: '', construction: '', area: +z.floorArea.toFixed(3), uValue: '', geometrySource: z.boundarySource || '', spaceBoundaryGlobalId: '' }); });
     m.surfaces.forEach(sid => {
       const s = tm.surfById.get(sid);
       const c = tm.constructions.get(s.constructionKey);
-      rows.push({ ...base, bemObject: `BuildingSurface:Detailed (${s.type})`, bemName: s.name, zone: tm.zoneByKey.get(s.zoneKey).name, boundary: s.bc, construction: c ? c.name : '', area: +s.area.toFixed(3), uValue: c && c.uValue ? +c.uValue.toFixed(3) : '' });
+      rows.push({ ...base, bemObject: `BuildingSurface:Detailed (${s.type})`, bemName: s.name, zone: tm.zoneByKey.get(s.zoneKey).name, boundary: s.bc, construction: c ? c.name : '', area: +s.area.toFixed(3), uValue: c && c.uValue ? +c.uValue.toFixed(3) : '', geometrySource: s.boundarySource || '', spaceBoundaryGlobalId: s.sbGlobalId || '' });
     });
     m.subsurfaces.forEach(wid => {
       const w = tm.subsurfaces.find(x => x.id === wid);
       const host = tm.surfById.get(w.hostId);
       const g = w.type === 'Window' ? tm.windowTypes.get(w.constructionKey) : tm.constructions.get(w.constructionKey);
-      rows.push({ ...base, bemObject: `FenestrationSurface:Detailed (${w.type})`, bemName: w.name, zone: tm.zoneByKey.get(host.zoneKey).name, boundary: host.bc, construction: g ? g.name : '', area: +w.area.toFixed(3), uValue: g ? +(g.uFactor || g.uValue || 0).toFixed(3) : '' });
+      rows.push({ ...base, bemObject: `FenestrationSurface:Detailed (${w.type})`, bemName: w.name, zone: tm.zoneByKey.get(host.zoneKey).name, boundary: host.bc, construction: g ? g.name : '', area: +w.area.toFixed(3), uValue: g ? +(g.uFactor || g.uValue || 0).toFixed(3) : '', geometrySource: w.sbGlobalId ? 'IfcRelSpaceBoundary' : 'projected IFC body', spaceBoundaryGlobalId: w.sbGlobalId || '' });
     });
   });
   return rows;

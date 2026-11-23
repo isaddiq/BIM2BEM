@@ -5,12 +5,36 @@ const APP_NAME = 'BIM2BEM';
 // public source only when a visitor opens them.
 const SAMPLES = [
   {
+    id: 'seoul-exchange-tower',
+    name: 'Seoul Exchange Tower',
+    file: 'SeoulExchangeTower.ifc',
+    url: 'assets/ifc/SeoulExchangeTower.ifc',
+    size: '3.5 MB',
+    facts: '8 storeys, 104 rooms, 256 windows; architecture, structure and MEP, thermal material data, second-level space boundaries, site in Seoul',
+    credit: 'Reference model generated for BIM2BEM (IFC4), MIT licence',
+    creditUrl: 'https://github.com/isaddiq/BIM2BEM/blob/main/LICENSE',
+    bundled: true,
+    downloadable: true,
+  },
+  {
     id: 'bem-demo-office',
     name: 'BEM demo office',
     file: 'BEMDemoOffice.ifc',
     url: 'assets/ifc/BEMDemoOffice.ifc',
     size: '70 KB',
     facts: '2 storeys, 8 rooms, layered constructions with thermal properties, glazing data, site and true north',
+    credit: 'Reference model generated for BIM2BEM (IFC4), MIT licence',
+    creditUrl: 'https://github.com/isaddiq/BIM2BEM/blob/main/scripts/make_sample_bem_office.py',
+    bundled: true,
+    downloadable: true,
+  },
+  {
+    id: 'bem-demo-office-sb',
+    name: 'BEM demo office with space boundaries',
+    file: 'BEMDemoOffice-SB.ifc',
+    url: 'assets/ifc/BEMDemoOffice-SB.ifc',
+    size: '114 KB',
+    facts: 'The demo office plus second-level space boundaries (IfcRelSpaceBoundary2ndLevel), used as zone surfaces',
     credit: 'Reference model generated for BIM2BEM (IFC4), MIT licence',
     creditUrl: 'https://github.com/isaddiq/BIM2BEM/blob/main/scripts/make_sample_bem_office.py',
     bundled: true,
@@ -796,7 +820,7 @@ function StartScreen({ onUpload, onLoadFile, onLoadSample, currentModel, onResum
             <p>BIM2BEM converts a building information model into an EnergyPlus model, runs the simulation in your browser with location-specific weather data, and evaluates energy demand and indoor environmental quality. Every input says where it came from: the IFC file, your entries, an open dataset or a documented assumption. Files never leave your machine.</p>
             <div className="start-actions">
               <button type="button" className="btn btn-primary btn-lg" onClick={onUpload}><Icons.Upload size={16} /> Open an IFC file</button>
-              <button type="button" className="btn btn-lg" onClick={() => onLoadSample(SAMPLES[0])}><Icons.Cube size={16} /> Try the BEM demo office</button>
+              <button type="button" className="btn btn-lg" onClick={() => onLoadSample(SAMPLES[0])}><Icons.Cube size={16} /> Try the demo tower</button>
             </div>
             <button type="button" className="dropzone" data-over={over} onClick={onUpload}>
               <Icons.Upload size={18} />
