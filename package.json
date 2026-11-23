@@ -1,0 +1,33 @@
+{
+  "name": "bim2bem",
+  "private": true,
+  "description": "BIM2BEM: browser-based IFC-to-EnergyPlus conversion, building energy simulation and indoor environmental quality analysis.",
+  "homepage": "https://isaddiq.github.io/BIM2BEM/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/isaddiq/BIM2BEM.git"
+  },
+  "bugs": "https://github.com/isaddiq/BIM2BEM/issues",
+  "author": "Saddiq (https://isaddiq.github.io/)",
+  "license": "MIT",
+  "scripts": {
+    "build": "esbuild assets/js/core/schema.jsx assets/js/core/ifcloader.jsx assets/js/core/building.jsx assets/js/core/plan.jsx assets/js/core/geom.jsx assets/js/core/materials.jsx assets/js/core/idf.jsx assets/js/core/weather.jsx assets/js/core/comfort.jsx assets/js/core/bem.jsx assets/js/core/epmodel.jsx assets/js/core/results.jsx assets/js/core/engine.jsx assets/js/viewer/viewer.jsx assets/js/viewer/viewcube.jsx assets/js/ui/icons.jsx assets/js/ui/panels.jsx assets/js/ui/charts.jsx assets/js/ui/planview.jsx assets/js/ui/location.jsx assets/js/ui/bemui.jsx assets/js/ui/bemview.jsx assets/js/ui/analysis.jsx assets/js/ui/reports.jsx assets/js/app.jsx --outbase=assets/js --outdir=assets/js/compiled --format=iife --target=es2018 --jsx-factory=React.createElement --jsx-fragment=React.Fragment --log-level=warning",
+    "test": "npm run build && node tests/run-tests.mjs",
+    "test:network": "npm run build && node tests/run-tests.mjs --network",
+    "vendor": "node scripts/vendor.mjs",
+    "vendor:engine": "node scripts/vendor.mjs --engine",
+    "gen:schema": "node scripts/gen-ep-schema.mjs",
+    "gen:stations": "node scripts/gen-station-index.mjs",
+    "gen:sample": "py -3.13 scripts/make_sample_bem_office.py assets/ifc/BEMDemoOffice.ifc",
+    "serve": "npx --yes serve ."
+  },
+  "devDependencies": {
+    "@idfkit/engine": "^0.6.0",
+    "@idfkit/engine-assets": "^26.2.0",
+    "earcut": "^3.0.1",
+    "esbuild": "^0.21.5",
+    "polygon-clipping": "^0.15.7",
+    "puppeteer-core": "^24.43.1",
+    "web-ifc": "^0.0.35"
+  }
+}

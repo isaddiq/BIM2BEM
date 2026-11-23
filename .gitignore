@@ -1,0 +1,43 @@
+# Local-only files: everything below stays on this machine and is not published.
+# The Pages workflow (.github/workflows/pages.yml) still needs package.json,
+# package-lock.json, scripts/vendor.mjs, tests/run-tests.mjs, tests/harness.mjs and
+# tests/fixtures/, so those are tracked.
+
+# Project notes, validation write-up and prompts
+docs/
+
+# Local generator for the Research centre sample model (not published)
+tools/
+
+# Editor and assistant settings
+.vscode/
+.idea/
+.claude/
+*.code-workspace
+
+# Dependencies
+node_modules/
+
+# Generated at build/deploy time
+assets/energyplus/
+_site/
+
+# Test output and screenshots
+tests/last-run.json
+tests/shots/
+*.log
+npm-debug.log*
+
+# Python caches (sample-model generator)
+__pycache__/
+*.pyc
+.venv/
+
+# Local secrets and environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

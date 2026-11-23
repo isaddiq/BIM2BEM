@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>BIM2BEM · IFC to EnergyPlus, energy and IEQ analysis in the browser</title>
+<meta name="description" content="Free browser-based BIM-to-BEM workflow: convert IFC models into EnergyPlus models, run EnergyPlus (WebAssembly) with location-specific open weather data, and evaluate energy demand, thermal comfort, CO₂ and daylight. Nothing is uploaded." />
+<meta name="keywords" content="BIM to BEM, IFC to EnergyPlus, building energy modeling, EnergyPlus WebAssembly, IDF, epJSON, thermal zones, indoor environmental quality, PMV PPD, ISO 7730, EPW weather, ERA5, Open-Meteo, NASA POWER, IFC viewer, IFC2x3, IFC4" />
+<meta name="author" content="Saddiq" />
+<meta name="robots" content="index, follow" />
+<meta name="theme-color" content="#f3f5f7" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#0f1a24" media="(prefers-color-scheme: dark)" />
+<link rel="canonical" href="https://isaddiq.github.io/BIM2BEM/" />
+<meta property="og:site_name" content="BIM2BEM" />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://isaddiq.github.io/BIM2BEM/" />
+<meta property="og:title" content="BIM2BEM · From IFC model to building energy model" />
+<meta property="og:description" content="Convert IFC to EnergyPlus, simulate with open weather data and evaluate energy and indoor environmental quality, entirely in the browser." />
+<meta property="og:image" content="https://isaddiq.github.io/BIM2BEM/assets/logos/icon-512.png" />
+<meta name="twitter:card" content="summary" />
+<link rel="icon" type="image/png" sizes="32x32" href="assets/logos/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="assets/logos/icon-192.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="assets/logos/apple-touch-icon.png" />
+<link rel="manifest" href="site.webmanifest" />
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebApplication",
+  "name": "BIM2BEM",
+  "url": "https://isaddiq.github.io/BIM2BEM/",
+  "description": "Browser-based BIM-to-BEM conversion and building performance simulation with EnergyPlus compiled to WebAssembly.",
+  "applicationCategory": "DesignApplication",
+  "operatingSystem": "Any (modern web browser with WebAssembly)",
+  "isAccessibleForFree": true,
+  "license": "https://opensource.org/licenses/MIT",
+  "author": { "@type": "Person", "name": "Saddiq", "url": "https://isaddiq.github.io/" }
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="assets/css/main.css" />
+<link rel="stylesheet" href="assets/css/bem.css" />
+<script>
+  // Apply the saved or system theme before first paint.
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem('bim2bem-theme'); } catch (e) {}
+    if (t !== 'light' && t !== 'dark') t = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', t);
+  })();
+</script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1" crossorigin="anonymous"></script>
+<script>
+  const { useCallback, useEffect, useMemo, useReducer, useRef, useState } = React;
+</script>
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+window.THREE = THREE;
+
+// Each compiled script is an IIFE that publishes its API on window; order matters.
+// The EnergyPlus engine is not listed: it loads on the first simulation (assets/js/core/engine.jsx).
+const appScripts = [
+  'assets/vendor/polygon-clipping.umd.min.js',
+  'assets/vendor/earcut.min.js',
+  'assets/js/data/ep-schema.js',
+  'assets/js/data/ep-stations.js',
+  'assets/js/data/engine-config.js',
+  'assets/js/compiled/core/schema.js',
+  'assets/js/compiled/core/ifcloader.js',
+  'assets/js/compiled/core/building.js',
+  'assets/js/compiled/core/plan.js',
+  'assets/js/compiled/core/geom.js',
+  'assets/js/compiled/core/materials.js',
+  'assets/js/compiled/core/idf.js',
+  'assets/js/compiled/core/weather.js',
+  'assets/js/compiled/core/comfort.js',
+  'assets/js/compiled/core/bem.js',
+  'assets/js/compiled/core/epmodel.js',
+  'assets/js/compiled/core/results.js',
+  'assets/js/compiled/core/engine.js',
+  'assets/js/compiled/viewer/viewer.js',
+  'assets/js/compiled/viewer/viewcube.js',
+  'assets/js/compiled/ui/icons.js',
+  'assets/js/compiled/ui/panels.js',
+  'assets/js/compiled/ui/charts.js',
+  'assets/js/compiled/ui/planview.js',
+  'assets/js/compiled/ui/location.js',
+  'assets/js/compiled/ui/bemui.js',
+  'assets/js/compiled/ui/bemview.js',
+  'assets/js/compiled/ui/analysis.js',
+  'assets/js/compiled/ui/reports.js',
+  'assets/js/compiled/app.js',
+];
+
+try {
+  await Promise.all(appScripts.map(src => new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = false;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(script);
+  })));
+} catch (err) {
+  document.getElementById('root').innerHTML = '<div class="boot-error"><h1>BIM2BEM could not start</h1><p>' + err.message + '. Serve the folder over HTTP (for example <code>npx serve .</code>) instead of opening the file directly.</p></div>';
+}
+</script>
+</head>
+<body>
+<main id="root">
+  <noscript><div class="boot-error"><h1>BIM2BEM</h1><p>BIM2BEM needs JavaScript and WebAssembly to read IFC files and run EnergyPlus in your browser.</p></div></noscript>
+</main>
+
+<div id="vc-popover" class="vc-popover" role="dialog" aria-label="Visitor statistics">
+  <div class="vc-popover-top">
+    <span>Visitor statistics</span>
+    <button type="button" class="vc-pop-close" onclick="document.getElementById('vc-popover').classList.remove('vc-open')" aria-label="Close visitor statistics">&times;</button>
+  </div>
+  <a href="https://s05.flagcounter.com/more/RvmU" target="_blank" rel="noopener noreferrer" class="vc-flag-link" title="Full analytics">
+    <img src="https://s05.flagcounter.com/count2/RvmU/bg_FFFFFF/txt_000000/border_CCCCCC/columns_8/maxflags_250/viewers_0/labels_1/pageviews_0/flags_0/percent_0/" alt="Flag Counter" border="0" class="vc-flag-img" loading="eager" fetchpriority="low" referrerpolicy="no-referrer-when-downgrade" />
+  </a>
+</div>
+</body>
+</html>
